@@ -1,0 +1,83 @@
+name: KP Scraper (Parallel)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # ── Stage 1: Discover all categories & groups (~5 min) ──
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install Playwright
+        run: pip install playwright && playwright install chromium --with-deps
+      - name: Discover categories
+        run: python scraper.py discover
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-plan
+          path: scan_plan.json
+
+  # ── Stage 2: 20 parallel scan workers (~3-5h each) ──
+  scan:
+    needs: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      matrix:
+        worker: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install Playwright
+        run: pip install playwright && playwright install chromium --with-deps
+      - uses: actions/download-artifact@v4
+        with: { name: scan-plan }
+      - name: "Scan (worker ${{ matrix.worker }})"
+        run: python scraper.py scan --worker ${{ matrix.worker }} --of 20
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: leads-worker-${{ matrix.worker }}
+          path: "leads_${{ matrix.worker }}.csv"
+
+  # ── Stage 3: Merge all results ──
+  merge:
+    needs: scan
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: leads-worker-*
+          merge-multiple: true
+      - name: Merge leads
+        run: python scraper.py merge
+      - uses: actions/upload-artifact@v4
+        with:
+          name: leads-final
+          path: leads.csv
+          overwrite: true
+      - name: Commit to repo
+        run: |
+          git config user.name "Scraper Bot"
+          git config user.email "bot@users.noreply.github.com"
+          cp leads.csv leads_final.csv 2>/dev/null || true
+          git add -f leads.csv leads_final.csv
+          git diff --staged --quiet || (git commit -m "leads.csv $(date -u +'%Y-%m-%d %H:%M UTC')" && git push)
+      - name: Summary
+        run: |
+          echo "## Results" >> $GITHUB_STEP_SUMMARY
+          LINES=$(wc -l < leads.csv)
+          echo "**$((LINES - 1)) qualified sellers** found" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Download leads.csv from Artifacts above ⬆️" >> $GITHUB_STEP_SUMMARY
